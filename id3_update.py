@@ -139,13 +139,14 @@ def get_metadata_from_mb(recording_id: str) -> dict | None:
             genre = tags[0].get("name", "").title()
 
         return {
-            "title": title,
-            "artist": artist,
-            "album": album,
-            "year": year,
-            "track": track_no,
-            "genre": genre,
+            "title":      title,
+            "artist":     artist,
+            "album":      album,
+            "year":       year,
+            "track":      track_no,
+            "genre":      genre,
             "release_id": release_id,
+            "cover_url":  "",
         }
 
     except musicbrainzngs.WebServiceError as e:
@@ -223,7 +224,7 @@ def search_by_metadata(filepath: str) -> str | None:
 
 
 def fetch_cover_art(release_id: str) -> bytes | None:
-    """從 Cover Art Archive 下載封面圖"""
+    """從 Cover Art Archive 下載封面圖（MusicBrainz release ID）"""
     if not release_id:
         return None
     url = f"https://coverartarchive.org/release/{release_id}/front-500"
@@ -234,6 +235,151 @@ def fetch_cover_art(release_id: str) -> bytes | None:
             return resp.content
     except Exception as e:
         print(f"  [警告] 封面下載失敗：{e}")
+    return None
+
+
+def fetch_cover_from_url(url: str) -> bytes | None:
+    """從直接 URL 下載封面圖（iTunes / Last.fm / Discogs）"""
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            print(f"  [封面] 下載成功 ({len(resp.content) // 1024} KB)")
+            return resp.content
+    except Exception as e:
+        print(f"  [警告] 封面下載失敗：{e}")
+    return None
+
+
+def search_itunes(title: str, artist: str) -> dict | None:
+    """用 iTunes Search API 搜尋（免費，無需 Key）"""
+    if not title:
+        return None
+    query = f"{artist} {title}".strip()
+    print(f"  [iTunes] 搜尋：{query!r}")
+    try:
+        resp = requests.get(
+            "https://itunes.apple.com/search",
+            params={"term": query, "media": "music", "entity": "song", "limit": 5},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if not results:
+            print("  [iTunes] 無結果")
+            return None
+        r = results[0]
+        print(f"  [iTunes] 找到：{r.get('artistName')} - {r.get('trackName')}")
+        # 封面圖：把 100x100 換成 600x600 高解析
+        cover_url = r.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+        year = (r.get("releaseDate") or "")[:4]
+        return {
+            "title":      normalize_title(r.get("trackName", "")),
+            "artist":     r.get("artistName", ""),
+            "album":      r.get("collectionName", ""),
+            "year":       year if year.isdigit() else "",
+            "track":      str(r.get("trackNumber", "")),
+            "genre":      r.get("primaryGenreName", ""),
+            "release_id": "",
+            "cover_url":  cover_url,
+        }
+    except Exception as e:
+        print(f"  [iTunes] 搜尋失敗：{e}")
+    return None
+
+
+def search_lastfm(title: str, artist: str) -> dict | None:
+    """用 Last.fm API 搜尋 track.getInfo"""
+    api_key = os.getenv("LASTFM_API_KEY", "")
+    if not api_key or not title or not artist:
+        return None
+    print(f"  [Last.fm] 搜尋：{artist!r} - {title!r}")
+    try:
+        resp = requests.get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={
+                "method":   "track.getInfo",
+                "api_key":  api_key,
+                "artist":   artist,
+                "track":    title,
+                "format":   "json",
+                "autocorrect": 1,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data or "track" not in data:
+            print(f"  [Last.fm] 無結果")
+            return None
+        t = data["track"]
+        album_data = t.get("album", {})
+        # 封面：取最大尺寸
+        images = album_data.get("image", [])
+        cover_url = next((img["#text"] for img in reversed(images) if img.get("#text")), "")
+        # 曲風：top tag
+        tags = t.get("toptags", {}).get("tag", [])
+        genre = tags[0]["name"].title() if tags else ""
+        found_artist = t.get("artist", {}).get("name", artist) if isinstance(t.get("artist"), dict) else t.get("artist", artist)
+        print(f"  [Last.fm] 找到：{found_artist} - {t.get('name')}")
+        return {
+            "title":      normalize_title(t.get("name", "")),
+            "artist":     found_artist,
+            "album":      album_data.get("title", ""),
+            "year":       "",   # track.getInfo 不回傳年份，需另查
+            "track":      str(t.get("@attr", {}).get("position", "")),
+            "genre":      genre,
+            "release_id": "",
+            "cover_url":  cover_url,
+        }
+    except Exception as e:
+        print(f"  [Last.fm] 搜尋失敗：{e}")
+    return None
+
+
+def search_discogs(title: str, artist: str) -> dict | None:
+    """用 Discogs API 搜尋 release 資訊"""
+    token = os.getenv("DISCOGS_TOKEN", "")
+    if not token or not title:
+        return None
+    query = f"{artist} {title}".strip()
+    print(f"  [Discogs] 搜尋：{query!r}")
+    try:
+        resp = requests.get(
+            "https://api.discogs.com/database/search",
+            params={"q": query, "type": "release", "per_page": 5},
+            headers={
+                "Authorization": f"Discogs token={token}",
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if not results:
+            print("  [Discogs] 無結果")
+            return None
+        r = results[0]
+        # title 格式通常是 "Artist - Album"
+        raw_title = r.get("title", "")
+        album = raw_title.split(" - ", 1)[-1] if " - " in raw_title else raw_title
+        genres = r.get("genre", []) + r.get("style", [])
+        year = str(r.get("year", ""))
+        cover_url = r.get("cover_image", "") or r.get("thumb", "")
+        print(f"  [Discogs] 找到：{raw_title} ({year})")
+        return {
+            "title":      normalize_title(title),   # Discogs 無 track title，沿用搜尋用的 title
+            "artist":     artist,
+            "album":      album,
+            "year":       year if year.isdigit() else "",
+            "track":      "",
+            "genre":      genres[0].title() if genres else "",
+            "release_id": "",
+            "cover_url":  cover_url,
+        }
+    except Exception as e:
+        print(f"  [Discogs] 搜尋失敗：{e}")
     return None
 
 
@@ -404,7 +550,10 @@ def update_tags(filepath: str, metadata: dict, cover: bytes | None, dry_run: boo
 
 
 def identify_file(filepath: str) -> dict | None:
-    """識別單一檔案，回傳 metadata（不寫入）"""
+    """
+    識別單一檔案，回傳 metadata（不寫入）。
+    識別鏈：① AcoustID → ② MusicBrainz 文字 → ③ iTunes → ④ Last.fm → ⑤ Discogs
+    """
     p = Path(filepath)
     print(f"\n識別：{p.name}")
 
@@ -413,20 +562,45 @@ def identify_file(filepath: str) -> dict | None:
         return None
     fingerprint, duration = result
 
+    # ① AcoustID 指紋 → MusicBrainz
     recording_id = lookup_acoustid(fingerprint, duration)
+
+    # ② MusicBrainz 文字搜尋
     if not recording_id:
         recording_id = search_by_metadata(filepath)
-    if not recording_id:
-        print("  [失敗] 兩種方式都無法識別，跳過")
-        return None
 
-    time.sleep(1)  # MusicBrainz 限速
-    metadata = get_metadata_from_mb(recording_id)
-    if not metadata:
-        print("  [失敗] 無法取得 metadata，跳過")
-        return None
+    # ① ② 有結果 → 從 MusicBrainz 取完整 metadata
+    if recording_id:
+        time.sleep(1)  # MusicBrainz 限速
+        metadata = get_metadata_from_mb(recording_id)
+        if metadata:
+            metadata.setdefault("cover_url", "")
+            return metadata
 
-    return metadata
+    # ③ ④ ⑤ 備用 API：用現有標籤 / 檔名取得 title + artist
+    info = read_existing_tags(filepath)
+    title  = info.get("title", "")
+    artist = info.get("artist", "")
+
+    # ③ iTunes
+    metadata = search_itunes(title, artist)
+    if metadata:
+        return metadata
+
+    # ④ Last.fm
+    time.sleep(0.5)
+    metadata = search_lastfm(title, artist)
+    if metadata:
+        return metadata
+
+    # ⑤ Discogs
+    time.sleep(1)
+    metadata = search_discogs(title, artist)
+    if metadata:
+        return metadata
+
+    print("  [失敗] 所有方式都無法識別，跳過")
+    return None
 
 
 def vote_album_consensus(results: list[dict | None]) -> dict:
@@ -474,11 +648,18 @@ def process_folder(files: list[Path], dry_run: bool, no_cover: bool):
     all_meta = [m for _, m in file_results]
     consensus = vote_album_consensus(all_meta)
 
-    # ── 下載封面（用 consensus release_id）─────────────────────────────────
+    # ── 下載封面（優先 consensus release_id，備用各曲 cover_url 多數決）──────
     cover = None
-    if not no_cover and consensus.get("release_id"):
+    if not no_cover:
         print()
-        cover = fetch_cover_art(consensus["release_id"])
+        if consensus.get("release_id"):
+            cover = fetch_cover_art(consensus["release_id"])
+        if cover is None:
+            # 從成功識別的結果中找最常出現的 cover_url
+            cover_urls = [m["cover_url"] for m in all_meta if m and m.get("cover_url")]
+            if cover_urls:
+                best_url = Counter(cover_urls).most_common(1)[0][0]
+                cover = fetch_cover_from_url(best_url)
 
     # ── 第二輪：寫入（per-track 欄位保留自身，專輯級欄位用 consensus）───────
     print(f"\n{'─'*50}")
@@ -495,16 +676,104 @@ def process_folder(files: list[Path], dry_run: bool, no_cover: bool):
         update_tags(str(f), metadata, cover, dry_run=dry_run)
 
 
+def _get_cover(metadata: dict, no_cover: bool) -> bytes | None:
+    """根據 metadata 取得封面圖（優先 MusicBrainz，備用直接 URL）"""
+    if no_cover:
+        return None
+    if metadata.get("release_id"):
+        return fetch_cover_art(metadata["release_id"])
+    if metadata.get("cover_url"):
+        return fetch_cover_from_url(metadata["cover_url"])
+    return None
+
+
 def process_single(filepath: Path, dry_run: bool, no_cover: bool):
     """單一檔案模式：識別後直接寫入"""
     metadata = identify_file(str(filepath))
     if not metadata:
         return
-    cover = None
-    if not no_cover and metadata.get("release_id"):
-        cover = fetch_cover_art(metadata["release_id"])
+    cover = _get_cover(metadata, no_cover)
     print()
     update_tags(str(filepath), metadata, cover, dry_run=dry_run)
+
+
+def _ask(prompt: str, default: bool) -> bool:
+    """是/否提問，回傳 bool"""
+    hint = "[Y/n]" if default else "[y/N]"
+    ans = input(f"{prompt} {hint}: ").strip().lower()
+    if ans == "":
+        return default
+    return ans in {"y", "yes"}
+
+
+def _ask_path(prompt: str) -> Path:
+    """要求輸入路徑，直到存在為止"""
+    while True:
+        raw = input(prompt).strip().strip("'\"")
+        p = Path(raw).expanduser()
+        if p.exists():
+            return p
+        print(f"  找不到：{p}，請重新輸入")
+
+
+def _collect_files(target: Path) -> list[Path]:
+    if target.is_file():
+        return [target]
+    files = sorted(f for f in target.rglob("*") if f.suffix.lower() in SUPPORTED_FORMATS)
+    if not files:
+        print("找不到任何支援的音樂檔案（MP3 / AIFF / WAV / FLAC / OGG / Opus / M4A / WMA）")
+        sys.exit(0)
+    return files
+
+
+def _run(mode: int, target: Path, dry_run: bool, no_cover: bool):
+    files = _collect_files(target)
+
+    if dry_run:
+        print("（預覽模式：不會修改任何檔案）")
+
+    if mode == 1:
+        # 單曲模式：逐一識別並直接寫入，不投票
+        print(f"找到 {len(files)} 個檔案，單曲模式")
+        for f in files:
+            process_single(f, dry_run=dry_run, no_cover=no_cover)
+    else:
+        # 專輯模式：先全部識別，投票後統一寫入
+        print(f"找到 {len(files)} 個檔案，專輯模式（投票）")
+        process_folder(files, dry_run=dry_run, no_cover=no_cover)
+
+    print("\n全部完成！")
+
+
+def _menu():
+    """互動式選單"""
+    print()
+    print("╔══════════════════════════════════╗")
+    print("║        ID3 Auto Update           ║")
+    print("╠══════════════════════════════════╣")
+    print("║  1.  單曲模式  直接識別並更新     ║")
+    print("║  2.  專輯模式  投票後統一更新     ║")
+    print("║  0.  離開                        ║")
+    print("╚══════════════════════════════════╝")
+    print()
+
+    while True:
+        choice = input("請選擇模式 [0/1/2]: ").strip()
+        if choice in {"0", "1", "2"}:
+            break
+        print("  請輸入 0、1 或 2")
+
+    if choice == "0":
+        sys.exit(0)
+
+    mode = int(choice)
+    print()
+    target = _ask_path("請輸入音樂檔案或資料夾路徑：")
+    dry_run  = _ask("預覽模式（不修改檔案）？", default=False)
+    no_cover = not _ask("下載封面圖？", default=True)
+    print()
+
+    _run(mode, target, dry_run, no_cover)
 
 
 def main():
@@ -512,47 +781,42 @@ def main():
         description="自動從網路獲取正確音樂標籤並更新音樂檔案",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-支援格式：MP3、AIFF、WAV、FLAC、OGG、Opus、M4A/M4B/AAC、WMA
-
-資料夾模式會先識別所有歌曲，再對專輯資訊投票，
-確保少數錯誤識別不會污染整張專輯的標籤。
+模式：
+  1 = 單曲模式，直接識別並更新（不投票）
+  2 = 專輯模式，先全部識別，投票後統一更新
 
 範例：
-  python3 id3_update.py song.mp3                # 更新單一檔案
-  python3 id3_update.py ./album/                # 更新整張專輯（含投票機制）
-  python3 id3_update.py ./album/ --dry-run      # 預覽，不修改檔案
-  python3 id3_update.py ./album/ --no-cover     # 不下載封面圖
+  python3 id3_update.py                         # 互動選單
+  python3 id3_update.py 1 song.mp3              # 單曲模式
+  python3 id3_update.py 2 ./album/              # 專輯模式
+  python3 id3_update.py 2 ./album/ --dry-run    # 預覽
+  python3 id3_update.py 2 ./album/ --no-cover   # 不下載封面
         """
     )
-    parser.add_argument("path", help="音樂檔案或資料夾路徑")
+    parser.add_argument("mode", nargs="?", choices=["1", "2"],
+                        help="1=單曲模式  2=專輯模式（省略則進入選單）")
+    parser.add_argument("path", nargs="?", help="音樂檔案或資料夾路徑")
     parser.add_argument("--dry-run", action="store_true", help="預覽模式，不修改檔案")
     parser.add_argument("--no-cover", action="store_true", help="不下載封面圖")
     args = parser.parse_args()
 
     _check_env()
 
+    # 沒有帶參數 → 互動選單
+    if not args.mode:
+        _menu()
+        return
+
+    if not args.path:
+        print("錯誤：請提供路徑")
+        sys.exit(1)
+
     target = Path(args.path)
     if not target.exists():
         print(f"錯誤：找不到 {target}")
         sys.exit(1)
 
-    if target.is_file():
-        if args.dry_run:
-            print("（預覽模式：不會修改任何檔案）")
-        process_single(target, dry_run=args.dry_run, no_cover=args.no_cover)
-    else:
-        files = sorted(
-            f for f in target.rglob("*") if f.suffix.lower() in SUPPORTED_FORMATS
-        )
-        if not files:
-            print("找不到任何支援的音樂檔案（MP3 / AIFF / WAV / FLAC / OGG / Opus / M4A / WMA）")
-            sys.exit(0)
-        print(f"找到 {len(files)} 個檔案，啟用專輯投票模式")
-        if args.dry_run:
-            print("（預覽模式：不會修改任何檔案）")
-        process_folder(files, dry_run=args.dry_run, no_cover=args.no_cover)
-
-    print("\n全部完成！")
+    _run(int(args.mode), target, dry_run=args.dry_run, no_cover=args.no_cover)
 
 
 if __name__ == "__main__":
