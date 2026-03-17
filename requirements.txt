@@ -1,0 +1,5 @@
+mutagen
+pyacoustid
+musicbrainzngs
+requests
+python-dotenv
