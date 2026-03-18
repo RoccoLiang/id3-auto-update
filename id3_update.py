@@ -59,8 +59,8 @@ def fingerprint_file(filepath: str) -> tuple[str, int] | None:
         return None
 
 
-def lookup_acoustid(fingerprint: str, duration: int) -> str | None:
-    """用指紋查詢 AcoustID，回傳 MusicBrainz Recording ID"""
+def lookup_acoustid(fingerprint: str, duration: int) -> tuple[str, float] | None:
+    """用指紋查詢 AcoustID，回傳 (MusicBrainz Recording ID, 信心分數)"""
     try:
         results = acoustid.lookup(
             ACOUSTID_API_KEY,
@@ -71,7 +71,7 @@ def lookup_acoustid(fingerprint: str, duration: int) -> str | None:
         for score, recording_id, title, artist in acoustid.parse_lookup_result(results):
             if score > 0.5 and recording_id:
                 print(f"  [指紋] 識別成功（信心：{score:.0%}）：{artist} - {title}")
-                return recording_id
+                return recording_id, score
     except acoustid.WebServiceError as e:
         msg = str(e)
         if "invalid API key" in msg or "code 4" in msg:
@@ -569,7 +569,9 @@ def identify_file(filepath: str) -> dict | None:
     result = fingerprint_file(filepath)
     if result:
         fingerprint, duration = result
-        recording_id = lookup_acoustid(fingerprint, duration)
+        acoustid_result = lookup_acoustid(fingerprint, duration)
+        if acoustid_result:
+            recording_id, _ = acoustid_result
 
     # ② MusicBrainz 文字搜尋
     if not recording_id:
@@ -580,7 +582,6 @@ def identify_file(filepath: str) -> dict | None:
         time.sleep(1)  # MusicBrainz 限速
         metadata = get_metadata_from_mb(recording_id)
         if metadata:
-            metadata.setdefault("cover_url", "")
             return metadata
 
     # ③ ④ ⑤ 備用 API：用現有標籤 / 檔名取得 title + artist
@@ -789,36 +790,29 @@ def _get_cover(metadata: dict, no_cover: bool) -> bytes | None:
         return None
 
     # ① 嘗試所有 MusicBrainz release IDs
-    for rid in metadata.get("release_ids", []) or ([metadata["release_id"]] if metadata.get("release_id") else []):
+    release_ids = metadata.get("release_ids") or (
+        [metadata["release_id"]] if metadata.get("release_id") else []
+    )
+    for rid in release_ids:
         cover = fetch_cover_art(rid)
         if cover:
             return cover
 
-    # ② iTunes 備用封面
+    # ② 直接 URL（iTunes / Last.fm / Discogs 回傳的，已在 metadata 裡）
+    if metadata.get("cover_url"):
+        cover = fetch_cover_from_url(metadata["cover_url"])
+        if cover:
+            return cover
+
+    # ③ iTunes 最後備用（其他來源都沒有 cover_url 時才查）
     title  = metadata.get("title", "")
     artist = metadata.get("artist", "")
-    if title or artist:
-        try:
-            resp = requests.get(
-                "https://itunes.apple.com/search",
-                params={"term": f"{artist} {title}".strip(), "media": "music",
-                        "entity": "song", "limit": 1},
-                timeout=10,
-            )
-            results = resp.json().get("results", [])
-            if results:
-                itunes_url = results[0].get("artworkUrl100", "").replace("100x100bb", "600x600bb")
-                if itunes_url:
-                    cover = fetch_cover_from_url(itunes_url)
-                    if cover:
-                        print(f"  [封面] iTunes 備用下載成功 ({len(cover) // 1024} KB)")
-                        return cover
-        except Exception:
-            pass
-
-    # ③ 直接 URL（其他 API 回傳）
-    if metadata.get("cover_url"):
-        return fetch_cover_from_url(metadata["cover_url"])
+    itunes_meta = search_itunes(title, artist)
+    if itunes_meta and itunes_meta.get("cover_url"):
+        cover = fetch_cover_from_url(itunes_meta["cover_url"])
+        if cover:
+            print(f"  [封面] iTunes 備用下載成功 ({len(cover) // 1024} KB)")
+            return cover
 
     print("  [警告] 找不到封面圖")
     return None
@@ -944,29 +938,13 @@ def identify_file_all(filepath: str) -> list[tuple[str, dict]]:
     fp_result = fingerprint_file(filepath)
     if fp_result:
         fingerprint, duration = fp_result
-        # 取得 AcoustID 結果（含信心分數）供標籤顯示
-        try:
-            raw = acoustid.lookup(
-                ACOUSTID_API_KEY, fingerprint, duration,
-                meta="recordings releasegroups"
-            )
-            for score, recording_id, title, artist in acoustid.parse_lookup_result(raw):
-                if score > 0.5 and recording_id:
-                    print(f"  [AcoustID] 識別成功（信心：{score:.0%}）：{artist} - {title}")
-                    time.sleep(1)
-                    mb_meta = get_metadata_from_mb(recording_id)
-                    if mb_meta:
-                        mb_meta.setdefault("cover_url", "")
-                        results.append((f"AcoustID + MusicBrainz ({score:.0%})", mb_meta))
-                    break
-        except acoustid.WebServiceError as e:
-            msg = str(e)
-            if "invalid API key" in msg or "code 4" in msg:
-                print(f"  [AcoustID] API Key 無效")
-            else:
-                print(f"  [AcoustID] 查詢失敗：{e}")
-        except Exception as e:
-            print(f"  [AcoustID] 解析失敗：{e}")
+        acoustid_result = lookup_acoustid(fingerprint, duration)
+        if acoustid_result:
+            recording_id, score = acoustid_result
+            time.sleep(1)
+            mb_meta = get_metadata_from_mb(recording_id)
+            if mb_meta:
+                results.append((f"AcoustID + MusicBrainz ({score:.0%})", mb_meta))
 
     # 取得現有標籤 / 檔名作為搜尋提示
     info = read_existing_tags(filepath)
@@ -992,7 +970,6 @@ def identify_file_all(filepath: str) -> list[tuple[str, dict]]:
                     time.sleep(1)
                     mb_text_meta = get_metadata_from_mb(rec["id"])
                     if mb_text_meta:
-                        mb_text_meta.setdefault("cover_url", "")
                         # 避免與 AcoustID 結果完全重複
                         already = any(
                             m.get("title") == mb_text_meta.get("title")
