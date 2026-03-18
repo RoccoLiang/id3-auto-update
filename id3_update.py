@@ -11,14 +11,15 @@ import sys
 import time
 import argparse
 from collections import Counter
+from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import requests
 import acoustid
 import musicbrainzngs
-from pathlib import Path
-from dotenv import load_dotenv
 from mutagen import File as MutagenFile
-
-load_dotenv()
 from mutagen.id3 import (
     ID3, ID3NoHeaderError,
     TIT2, TPE1, TALB, TDRC, TRCK, TCON, APIC
@@ -138,15 +139,19 @@ def get_metadata_from_mb(recording_id: str) -> dict | None:
         if tags:
             genre = tags[0].get("name", "").title()
 
+        # 收集所有 release ID，供封面圖備用搜尋
+        all_release_ids = [rel.get("id", "") for rel in releases if rel.get("id")]
+
         return {
-            "title":      title,
-            "artist":     artist,
-            "album":      album,
-            "year":       year,
-            "track":      track_no,
-            "genre":      genre,
-            "release_id": release_id,
-            "cover_url":  "",
+            "title":       title,
+            "artist":      artist,
+            "album":       album,
+            "year":        year,
+            "track":       track_no,
+            "genre":       genre,
+            "release_id":  release_id,
+            "release_ids": all_release_ids,
+            "cover_url":   "",
         }
 
     except musicbrainzngs.WebServiceError as e:
@@ -224,15 +229,16 @@ def search_by_metadata(filepath: str) -> str | None:
 
 
 def fetch_cover_art(release_id: str) -> bytes | None:
-    """從 Cover Art Archive 下載封面圖（MusicBrainz release ID）"""
+    """從 Cover Art Archive 下載封面圖（單一 release ID）"""
     if not release_id:
         return None
     url = f"https://coverartarchive.org/release/{release_id}/front-500"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
-            print(f"  [封面] 下載成功 ({len(resp.content) // 1024} KB)")
+            print(f"  [封面] Cover Art Archive 下載成功 ({len(resp.content) // 1024} KB)")
             return resp.content
+        # 不印 404，由呼叫端決定是否繼續嘗試
     except Exception as e:
         print(f"  [警告] 封面下載失敗：{e}")
     return None
@@ -421,7 +427,7 @@ def _apply_id3_frames(tags, metadata: dict, cover: bytes | None):
         tags["APIC"] = APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover)
 
 
-def _apply_vorbis_tags(audio, metadata: dict, cover: bytes | None):
+def _apply_vorbis_tags(audio, metadata: dict):
     """將欄位寫入 Vorbis Comment（共用於 FLAC / OGG / Opus）"""
     if metadata.get("title"):
         audio["title"] = metadata["title"]
@@ -473,7 +479,7 @@ def update_tags(filepath: str, metadata: dict, cover: bytes | None, dry_run: boo
         # ── Vorbis 系列：FLAC ──────────────────────────────────────────────
         elif ext == ".flac":
             audio = FLAC(filepath)
-            _apply_vorbis_tags(audio, metadata, cover)
+            _apply_vorbis_tags(audio, metadata)
             if cover:
                 pic = Picture()
                 pic.type, pic.mime, pic.desc, pic.data = 3, "image/jpeg", "Cover", cover
@@ -484,12 +490,12 @@ def update_tags(filepath: str, metadata: dict, cover: bytes | None, dry_run: boo
         # ── Vorbis 系列：OGG / Opus ────────────────────────────────────────
         elif ext == ".ogg":
             audio = OggVorbis(filepath)
-            _apply_vorbis_tags(audio, metadata, cover)
+            _apply_vorbis_tags(audio, metadata)
             audio.save()
 
         elif ext == ".opus":
             audio = OggOpus(filepath)
-            _apply_vorbis_tags(audio, metadata, cover)
+            _apply_vorbis_tags(audio, metadata)
             audio.save()
 
         # ── MP4 系列：M4A / M4B / AAC ─────────────────────────────────────
@@ -553,17 +559,17 @@ def identify_file(filepath: str) -> dict | None:
     """
     識別單一檔案，回傳 metadata（不寫入）。
     識別鏈：① AcoustID → ② MusicBrainz 文字 → ③ iTunes → ④ Last.fm → ⑤ Discogs
+    即使指紋失敗也繼續嘗試文字搜尋與備用 API。
     """
     p = Path(filepath)
     print(f"\n識別：{p.name}")
 
-    result = fingerprint_file(filepath)
-    if not result:
-        return None
-    fingerprint, duration = result
-
     # ① AcoustID 指紋 → MusicBrainz
-    recording_id = lookup_acoustid(fingerprint, duration)
+    recording_id = None
+    result = fingerprint_file(filepath)
+    if result:
+        fingerprint, duration = result
+        recording_id = lookup_acoustid(fingerprint, duration)
 
     # ② MusicBrainz 文字搜尋
     if not recording_id:
@@ -635,7 +641,94 @@ def vote_album_consensus(results: list[dict | None]) -> dict:
     return consensus
 
 
-def process_folder(files: list[Path], dry_run: bool, no_cover: bool):
+def sanitize_filename(name: str) -> str:
+    """移除檔名中不合法的字元"""
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+
+
+def rename_files(
+    file_results: list[tuple[Path, dict | None]], dry_run: bool
+) -> list[tuple[Path, dict | None]]:
+    """將音樂檔案重新命名為 'XX. Title.ext' 格式"""
+    print(f"\n{'─'*50}")
+    print("重新命名檔案...")
+
+    new_results: list[tuple[Path, dict | None]] = []
+    for i, (f, metadata) in enumerate(file_results, 1):
+        if metadata is None:
+            new_results.append((f, metadata))
+            continue
+
+        # 曲目編號：metadata → 原檔名 → 順序號
+        track_raw = str(metadata.get("track", "")).split("/")[0].strip()
+        num = int(track_raw) if track_raw.isdigit() else i
+
+        title = sanitize_filename(metadata.get("title", "") or f.stem)
+        if not title:
+            new_results.append((f, metadata))
+            continue
+
+        new_name = f"{num:02d}. {title}{f.suffix}"
+        new_path = f.parent / new_name
+
+        if new_path == f:
+            print(f"  [略過] 已是正確格式：{f.name}")
+            new_results.append((f, metadata))
+            continue
+
+        print(f"  {'[預覽]' if dry_run else '[重新命名]'} {f.name}")
+        print(f"         → {new_name}")
+
+        if not dry_run:
+            try:
+                f.rename(new_path)
+                new_results.append((new_path, metadata))
+            except Exception as e:
+                print(f"  [錯誤] 重新命名失敗：{e}")
+                new_results.append((f, metadata))
+        else:
+            new_results.append((new_path, metadata))  # 預覽時也用新路徑讓 M3U8 正確
+
+    return new_results
+
+
+def create_m3u8(
+    file_results: list[tuple[Path, dict | None]], album: str, artist: str, dry_run: bool
+):
+    """在音樂資料夾建立 M3U8 播放清單"""
+    valid = [(f, m) for f, m in file_results if m is not None]
+    if not valid:
+        return
+
+    folder = valid[0][0].parent
+    name_parts = " - ".join(p for p in [sanitize_filename(artist), sanitize_filename(album)] if p)
+    m3u8_name  = name_parts or folder.name
+    m3u8_path  = folder / f"{m3u8_name}.m3u8"
+
+    lines = ["#EXTM3U", ""]
+    for f, metadata in valid:
+        track_artist = metadata.get("artist", "")
+        title        = metadata.get("title", "") or f.stem
+        display = f"{track_artist} - {title}" if track_artist else title
+        lines.append(f"#EXTINF:-1,{display}")
+        lines.append(f.name)   # 相對路徑
+        lines.append("")
+
+    content = "\n".join(lines)
+
+    print(f"\n{'─'*50}")
+    if dry_run:
+        print(f"[預覽] 將建立播放清單：{m3u8_path.name}（{len(valid)} 首）")
+    else:
+        try:
+            m3u8_path.write_text(content, encoding="utf-8")
+            print(f"[播放清單] 已建立：{m3u8_path.name}（{len(valid)} 首）")
+        except Exception as e:
+            print(f"[錯誤] 建立播放清單失敗：{e}")
+
+
+def process_folder(files: list[Path], dry_run: bool, no_cover: bool,
+                   do_rename: bool = False, do_m3u8: bool = False):
     """資料夾模式：先全部識別 → 投票 → 統一用 consensus 寫入"""
 
     # ── 第一輪：識別所有歌曲 ────────────────────────────────────────────────
@@ -655,7 +748,6 @@ def process_folder(files: list[Path], dry_run: bool, no_cover: bool):
         if consensus.get("release_id"):
             cover = fetch_cover_art(consensus["release_id"])
         if cover is None:
-            # 從成功識別的結果中找最常出現的 cover_url
             cover_urls = [m["cover_url"] for m in all_meta if m and m.get("cover_url")]
             if cover_urls:
                 best_url = Counter(cover_urls).most_common(1)[0][0]
@@ -669,32 +761,321 @@ def process_folder(files: list[Path], dry_run: bool, no_cover: bool):
         if metadata is None:
             print("  [略過] 識別失敗")
             continue
-        # 用 consensus 覆蓋專輯級欄位（artist 保留各曲目自身的值）
         for field in ("album", "year", "release_id"):
             if consensus.get(field):
                 metadata[field] = consensus[field]
         update_tags(str(f), metadata, cover, dry_run=dry_run)
 
+    # ── 重新命名 ─────────────────────────────────────────────────────────────
+    if do_rename:
+        file_results = rename_files(file_results, dry_run=dry_run)
+
+    # ── 建立 M3U8 ────────────────────────────────────────────────────────────
+    if do_m3u8:
+        artists = [m["artist"] for m in all_meta if m and m.get("artist")]
+        top_artist = Counter(artists).most_common(1)[0][0] if artists else ""
+        create_m3u8(file_results, album=consensus.get("album", ""),
+                    artist=top_artist, dry_run=dry_run)
+
 
 def _get_cover(metadata: dict, no_cover: bool) -> bytes | None:
-    """根據 metadata 取得封面圖（優先 MusicBrainz，備用直接 URL）"""
+    """
+    取得封面圖，依序嘗試：
+    ① Cover Art Archive（所有 release IDs）
+    ② iTunes Search（備用）
+    ③ 直接 URL（iTunes / Last.fm / Discogs 回傳的）
+    """
     if no_cover:
         return None
-    if metadata.get("release_id"):
-        return fetch_cover_art(metadata["release_id"])
+
+    # ① 嘗試所有 MusicBrainz release IDs
+    for rid in metadata.get("release_ids", []) or ([metadata["release_id"]] if metadata.get("release_id") else []):
+        cover = fetch_cover_art(rid)
+        if cover:
+            return cover
+
+    # ② iTunes 備用封面
+    title  = metadata.get("title", "")
+    artist = metadata.get("artist", "")
+    if title or artist:
+        try:
+            resp = requests.get(
+                "https://itunes.apple.com/search",
+                params={"term": f"{artist} {title}".strip(), "media": "music",
+                        "entity": "song", "limit": 1},
+                timeout=10,
+            )
+            results = resp.json().get("results", [])
+            if results:
+                itunes_url = results[0].get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+                if itunes_url:
+                    cover = fetch_cover_from_url(itunes_url)
+                    if cover:
+                        print(f"  [封面] iTunes 備用下載成功 ({len(cover) // 1024} KB)")
+                        return cover
+        except Exception:
+            pass
+
+    # ③ 直接 URL（其他 API 回傳）
     if metadata.get("cover_url"):
         return fetch_cover_from_url(metadata["cover_url"])
+
+    print("  [警告] 找不到封面圖")
     return None
 
 
-def process_single(filepath: Path, dry_run: bool, no_cover: bool):
-    """單一檔案模式：識別後直接寫入"""
-    metadata = identify_file(str(filepath))
-    if not metadata:
-        return
-    cover = _get_cover(metadata, no_cover)
+def _show_metadata(metadata: dict, cover: bytes | None):
+    """印出目前識別結果"""
+    print(f"\n{'─'*50}")
+    print(f"  標題：{metadata.get('title') or '（空）'}")
+    print(f"  藝人：{metadata.get('artist') or '（空）'}")
+    print(f"  專輯：{metadata.get('album') or '（空）'}")
+    print(f"  年份：{metadata.get('year') or '（空）'}")
+    print(f"  曲目：{metadata.get('track') or '（空）'}")
+    print(f"  曲風：{metadata.get('genre') or '（空）'}")
+    print(f"  封面：{'有 ✓' if cover else '無'}")
+    print(f"{'─'*50}")
+
+
+def _manual_edit(metadata: dict) -> dict:
+    """讓使用者逐欄位手動修改（按 Enter 保留原值）"""
+    print("  （直接按 Enter 保留原值）")
+    fields = [("title", "標題"), ("artist", "藝人"), ("album", "專輯"),
+              ("year", "年份"), ("track", "曲目"), ("genre", "曲風")]
+    for key, label in fields:
+        current = metadata.get(key, "")
+        val = input(f"  {label} [{current}]: ").strip()
+        if val:
+            metadata[key] = val
+    return metadata
+
+
+def _search_and_pick(no_cover: bool) -> tuple[dict | None, bytes | None]:
+    """讓使用者輸入關鍵字重新搜尋，顯示前 5 筆結果讓使用者挑選"""
+    query = input("  搜尋關鍵字（例：Armin van Buuren Communication）：").strip()
+    if not query:
+        return None, None
+
+    print(f"  搜尋中...")
+    try:
+        time.sleep(1)
+        results = musicbrainzngs.search_recordings(recording=query, limit=8)
+        recordings = results.get("recording-list", [])
+    except Exception as e:
+        print(f"  搜尋失敗：{e}")
+        return None, None
+
+    if not recordings:
+        print("  找不到任何結果")
+        return None, None
+
     print()
-    update_tags(str(filepath), metadata, cover, dry_run=dry_run)
+    for i, rec in enumerate(recordings[:8], 1):
+        score  = rec.get("ext:score", "?")
+        title  = rec.get("title", "")
+        artist = rec.get("artist-credit-phrase", "")
+        releases = rec.get("release-list", [])
+        album = releases[0].get("title", "") if releases else ""
+        print(f"  [{i}] ({score}%) {artist} - {title}  《{album}》")
+
+    print("  [0] 取消")
+    while True:
+        choice = input("  選擇編號：").strip()
+        if choice == "0":
+            return None, None
+        if choice.isdigit() and 1 <= int(choice) <= len(recordings[:8]):
+            rec = recordings[int(choice) - 1]
+            time.sleep(1)
+            metadata = get_metadata_from_mb(rec["id"])
+            if metadata:
+                cover = _get_cover(metadata, no_cover)
+                return metadata, cover
+            print("  取得 metadata 失敗，請選擇其他或輸入 0 取消")
+        else:
+            print(f"  請輸入 0 到 {len(recordings[:8])} 之間的數字")
+
+
+def _review_and_write(filepath: Path, metadata: dict, cover: bytes | None,
+                      no_cover: bool, dry_run: bool):
+    """顯示識別結果，讓使用者確認 / 編輯 / 重新搜尋後再寫入"""
+    while True:
+        _show_metadata(metadata, cover)
+        print("  [A] 接受並寫入    [E] 手動編輯")
+        print("  [S] 重新搜尋      [K] 跳過此檔案")
+
+        choice = input("  請選擇 [A/E/S/K]（Enter = A）：").strip().upper()
+        if choice == "":
+            choice = "A"
+
+        if choice == "A":
+            print()
+            update_tags(str(filepath), metadata, cover, dry_run=dry_run)
+            break
+
+        elif choice == "E":
+            metadata = _manual_edit(metadata)
+            cover = _get_cover(metadata, no_cover)
+
+        elif choice == "S":
+            result = _search_and_pick(no_cover)
+            if result[0]:
+                metadata, cover = result
+
+        elif choice == "K":
+            print("  [略過]")
+            break
+
+        else:
+            print("  請輸入 A、E、S 或 K")
+
+
+def identify_file_all(filepath: str) -> list[tuple[str, dict]]:
+    """
+    對單一檔案執行所有識別方法，回傳 list of (來源標籤, metadata)。
+    不在第一個成功時停止，全部嘗試後回傳所有結果供使用者比較選擇。
+    """
+    p = Path(filepath)
+    print(f"\n識別：{p.name}")
+    print("  正在執行所有識別方法...\n")
+
+    results: list[tuple[str, dict]] = []
+
+    # ① AcoustID 指紋 → MusicBrainz
+    fp_result = fingerprint_file(filepath)
+    if fp_result:
+        fingerprint, duration = fp_result
+        # 取得 AcoustID 結果（含信心分數）供標籤顯示
+        try:
+            raw = acoustid.lookup(
+                ACOUSTID_API_KEY, fingerprint, duration,
+                meta="recordings releasegroups"
+            )
+            for score, recording_id, title, artist in acoustid.parse_lookup_result(raw):
+                if score > 0.5 and recording_id:
+                    print(f"  [AcoustID] 識別成功（信心：{score:.0%}）：{artist} - {title}")
+                    time.sleep(1)
+                    mb_meta = get_metadata_from_mb(recording_id)
+                    if mb_meta:
+                        mb_meta.setdefault("cover_url", "")
+                        results.append((f"AcoustID + MusicBrainz ({score:.0%})", mb_meta))
+                    break
+        except acoustid.WebServiceError as e:
+            msg = str(e)
+            if "invalid API key" in msg or "code 4" in msg:
+                print(f"  [AcoustID] API Key 無效")
+            else:
+                print(f"  [AcoustID] 查詢失敗：{e}")
+        except Exception as e:
+            print(f"  [AcoustID] 解析失敗：{e}")
+
+    # 取得現有標籤 / 檔名作為搜尋提示
+    info = read_existing_tags(filepath)
+    title_hint  = info.get("title", "")
+    artist_hint = info.get("artist", "")
+
+    # ② MusicBrainz 文字搜尋
+    if title_hint:
+        try:
+            print(f"  [MusicBrainz 文字] 搜尋：{artist_hint!r} - {title_hint!r}")
+            time.sleep(1)
+            kwargs: dict = {"recording": title_hint, "limit": 3}
+            if artist_hint:
+                kwargs["artist"] = artist_hint
+            mb_results = musicbrainzngs.search_recordings(**kwargs)
+            recordings = mb_results.get("recording-list", [])
+            for rec in recordings:
+                score = int(rec.get("ext:score", 0))
+                if score >= 70:
+                    found_artist = rec.get("artist-credit-phrase", "")
+                    found_title  = rec.get("title", "")
+                    print(f"  [MusicBrainz 文字] 找到（{score}%）：{found_artist} - {found_title}")
+                    time.sleep(1)
+                    mb_text_meta = get_metadata_from_mb(rec["id"])
+                    if mb_text_meta:
+                        mb_text_meta.setdefault("cover_url", "")
+                        # 避免與 AcoustID 結果完全重複
+                        already = any(
+                            m.get("title") == mb_text_meta.get("title")
+                            and m.get("artist") == mb_text_meta.get("artist")
+                            and m.get("release_id") == mb_text_meta.get("release_id")
+                            for _, m in results
+                        )
+                        if not already:
+                            results.append((f"MusicBrainz 文字搜尋 ({score}%)", mb_text_meta))
+                    break
+        except Exception as e:
+            print(f"  [MusicBrainz 文字] 搜尋失敗：{e}")
+    else:
+        print("  [MusicBrainz 文字] 無標題資訊，跳過")
+
+    # ③ iTunes
+    itunes_meta = search_itunes(title_hint, artist_hint)
+    if itunes_meta:
+        results.append(("iTunes", itunes_meta))
+
+    # ④ Last.fm
+    time.sleep(0.5)
+    lastfm_meta = search_lastfm(title_hint, artist_hint)
+    if lastfm_meta:
+        results.append(("Last.fm", lastfm_meta))
+
+    # ⑤ Discogs
+    time.sleep(1)
+    discogs_meta = search_discogs(title_hint, artist_hint)
+    if discogs_meta:
+        results.append(("Discogs", discogs_meta))
+
+    return results
+
+
+def process_single(filepath: Path, dry_run: bool, no_cover: bool):
+    """單一檔案模式：執行所有識別方法，顯示比較，讓使用者挑選後寫入"""
+    all_results = identify_file_all(str(filepath))
+
+    if not all_results:
+        print("  [失敗] 所有方式都無法識別，跳過")
+        return
+
+    # ── 決定預設來源（優先 Last.fm，否則第一筆）────────────────────────────
+    default_idx = next(
+        (i for i, (label, _) in enumerate(all_results) if "Last.fm" in label),
+        0  # 找不到 Last.fm 則用第一筆
+    )
+
+    # ── 顯示比較表 ───────────────────────────────────────────────────────────
+    print(f"\n{'─'*50}")
+    print("識別結果比較：")
+    for i, (label, meta) in enumerate(all_results, 1):
+        title  = meta.get("title") or "（空）"
+        artist = meta.get("artist") or "（空）"
+        album  = meta.get("album", "")
+        year   = meta.get("year", "")
+        extra  = (f"  《{album}》" if album else "") + (f"  {year}" if year else "")
+        marker = " ★" if (i - 1) == default_idx else ""
+        print(f"  [{i}] {label}{marker}")
+        print(f"       {artist} - {title}{extra}")
+    print("  [0] 手動輸入（空白資料，手動填寫）")
+    print(f"{'─'*50}")
+
+    # ── 選擇資料來源（直接 Enter 採用 ★ 預設）────────────────────────────────
+    metadata = None
+    while metadata is None:
+        choice = input(f"  請選擇資料來源 [1-{len(all_results)}/0]（Enter = [{default_idx + 1}]）：").strip()
+        if choice == "":
+            metadata = all_results[default_idx][1]
+        elif choice == "0":
+            metadata = {
+                "title": "", "artist": "", "album": "", "year": "",
+                "track": "", "genre": "", "release_id": "", "cover_url": "",
+                "release_ids": [],
+            }
+        elif choice.isdigit() and 1 <= int(choice) <= len(all_results):
+            metadata = all_results[int(choice) - 1][1]
+        else:
+            print(f"  請輸入 0 到 {len(all_results)} 之間的數字")
+
+    cover = _get_cover(metadata, no_cover)
+    _review_and_write(filepath, metadata, cover, no_cover=no_cover, dry_run=dry_run)
 
 
 def _ask(prompt: str, default: bool) -> bool:
@@ -707,9 +1088,11 @@ def _ask(prompt: str, default: bool) -> bool:
 
 
 def _ask_path(prompt: str) -> Path:
-    """要求輸入路徑，直到存在為止"""
+    """要求輸入路徑，直到存在為止（自動處理 shell 跳脫和引號）"""
     while True:
         raw = input(prompt).strip().strip("'\"")
+        # 移除 shell 跳脫的反斜線（如 /path/My\ Music → /path/My Music）
+        raw = re.sub(r"\\(.)", r"\1", raw)
         p = Path(raw).expanduser()
         if p.exists():
             return p
@@ -722,58 +1105,83 @@ def _collect_files(target: Path) -> list[Path]:
     files = sorted(f for f in target.rglob("*") if f.suffix.lower() in SUPPORTED_FORMATS)
     if not files:
         print("找不到任何支援的音樂檔案（MP3 / AIFF / WAV / FLAC / OGG / Opus / M4A / WMA）")
-        sys.exit(0)
+        return []
     return files
 
 
-def _run(mode: int, target: Path, dry_run: bool, no_cover: bool):
+def _run(mode: int, target: Path, dry_run: bool, no_cover: bool,
+         do_rename: bool = False, do_m3u8: bool = False):
     files = _collect_files(target)
+    if not files:
+        return
 
     if dry_run:
         print("（預覽模式：不會修改任何檔案）")
 
     if mode == 1:
-        # 單曲模式：逐一識別並直接寫入，不投票
         print(f"找到 {len(files)} 個檔案，單曲模式")
         for f in files:
             process_single(f, dry_run=dry_run, no_cover=no_cover)
     else:
-        # 專輯模式：先全部識別，投票後統一寫入
         print(f"找到 {len(files)} 個檔案，專輯模式（投票）")
-        process_folder(files, dry_run=dry_run, no_cover=no_cover)
+        process_folder(files, dry_run=dry_run, no_cover=no_cover,
+                       do_rename=do_rename, do_m3u8=do_m3u8)
 
     print("\n全部完成！")
 
 
 def _menu():
-    """互動式選單"""
-    print()
-    print("╔══════════════════════════════════╗")
-    print("║        ID3 Auto Update           ║")
-    print("╠══════════════════════════════════╣")
-    print("║  1.  單曲模式  直接識別並更新     ║")
-    print("║  2.  專輯模式  投票後統一更新     ║")
-    print("║  0.  離開                        ║")
-    print("╚══════════════════════════════════╝")
-    print()
-
+    """互動式選單（完成後詢問是否繼續，直到使用者選擇離開）"""
     while True:
-        choice = input("請選擇模式 [0/1/2]: ").strip()
-        if choice in {"0", "1", "2"}:
-            break
-        print("  請輸入 0、1 或 2")
+        print()
+        print("╔══════════════════════════════════╗")
+        print("║        ID3 Auto Update           ║")
+        print("╠══════════════════════════════════╣")
+        print("║  1.  單曲模式  直接識別並更新    ║")
+        print("║  2.  專輯模式  投票後統一更新    ║")
+        print("║  0.  離開                        ║")
+        print("╚══════════════════════════════════╝")
+        print()
 
-    if choice == "0":
-        sys.exit(0)
+        while True:
+            choice = input("請選擇模式 [0/1/2]: ").strip()
+            if choice in {"0", "1", "2"}:
+                break
+            print("  請輸入 0、1 或 2")
 
-    mode = int(choice)
-    print()
-    target = _ask_path("請輸入音樂檔案或資料夾路徑：")
-    dry_run  = _ask("預覽模式（不修改檔案）？", default=False)
-    no_cover = not _ask("下載封面圖？", default=True)
-    print()
+        if choice == "0":
+            print("掰掰！")
+            sys.exit(0)
 
-    _run(mode, target, dry_run, no_cover)
+        mode = int(choice)
+        print()
+        dry_run  = _ask("預覽模式（不修改檔案）？", default=False)
+        no_cover = not _ask("下載封面圖？", default=True)
+        do_rename = False
+        do_m3u8   = False
+        if mode == 2:
+            do_rename = _ask("重新命名檔案（XX. Title.ext）？", default=True)
+            do_m3u8   = _ask("建立 M3U8 播放清單？", default=True)
+
+        # 單曲模式：完成後持續詢問下一首路徑（保留相同設定）
+        if mode == 1:
+            while True:
+                print()
+                target = _ask_path("請輸入音樂檔案路徑：")
+                print()
+                _run(mode, target, dry_run, no_cover)
+                print()
+                if not _ask("繼續處理下一首？", default=True):
+                    break
+        else:
+            while True:
+                print()
+                target = _ask_path("請輸入音樂資料夾路徑：")
+                print()
+                _run(mode, target, dry_run, no_cover, do_rename=do_rename, do_m3u8=do_m3u8)
+                print()
+                if not _ask("繼續處理下一個資料夾？", default=True):
+                    break
 
 
 def main():
@@ -796,8 +1204,10 @@ def main():
     parser.add_argument("mode", nargs="?", choices=["1", "2"],
                         help="1=單曲模式  2=專輯模式（省略則進入選單）")
     parser.add_argument("path", nargs="?", help="音樂檔案或資料夾路徑")
-    parser.add_argument("--dry-run", action="store_true", help="預覽模式，不修改檔案")
+    parser.add_argument("--dry-run",  action="store_true", help="預覽模式，不修改檔案")
     parser.add_argument("--no-cover", action="store_true", help="不下載封面圖")
+    parser.add_argument("--rename",   action="store_true", help="重新命名檔案（僅專輯模式）")
+    parser.add_argument("--m3u8",     action="store_true", help="建立 M3U8 播放清單（僅專輯模式）")
     args = parser.parse_args()
 
     _check_env()
@@ -816,7 +1226,8 @@ def main():
         print(f"錯誤：找不到 {target}")
         sys.exit(1)
 
-    _run(int(args.mode), target, dry_run=args.dry_run, no_cover=args.no_cover)
+    _run(int(args.mode), target, dry_run=args.dry_run, no_cover=args.no_cover,
+         do_rename=args.rename, do_m3u8=args.m3u8)
 
 
 if __name__ == "__main__":
