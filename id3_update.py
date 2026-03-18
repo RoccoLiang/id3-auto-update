@@ -281,14 +281,15 @@ def search_itunes(title: str, artist: str) -> dict | None:
         cover_url = r.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
         year = (r.get("releaseDate") or "")[:4]
         return {
-            "title":      normalize_title(r.get("trackName", "")),
-            "artist":     r.get("artistName", ""),
-            "album":      r.get("collectionName", ""),
-            "year":       year if year.isdigit() else "",
-            "track":      str(r.get("trackNumber", "")),
-            "genre":      r.get("primaryGenreName", ""),
-            "release_id": "",
-            "cover_url":  cover_url,
+            "title":       normalize_title(r.get("trackName", "")),
+            "artist":      r.get("artistName", ""),
+            "album":       r.get("collectionName", ""),
+            "year":        year if year.isdigit() else "",
+            "track":       str(r.get("trackNumber", "")),
+            "genre":       r.get("primaryGenreName", ""),
+            "release_id":  "",
+            "release_ids": [],
+            "cover_url":   cover_url,
         }
     except Exception as e:
         print(f"  [iTunes] 搜尋失敗：{e}")
@@ -330,14 +331,15 @@ def search_lastfm(title: str, artist: str) -> dict | None:
         found_artist = t.get("artist", {}).get("name", artist) if isinstance(t.get("artist"), dict) else t.get("artist", artist)
         print(f"  [Last.fm] 找到：{found_artist} - {t.get('name')}")
         return {
-            "title":      normalize_title(t.get("name", "")),
-            "artist":     found_artist,
-            "album":      album_data.get("title", ""),
-            "year":       "",   # track.getInfo 不回傳年份，需另查
-            "track":      str(t.get("@attr", {}).get("position", "")),
-            "genre":      genre,
-            "release_id": "",
-            "cover_url":  cover_url,
+            "title":       normalize_title(t.get("name", "")),
+            "artist":      found_artist,
+            "album":       album_data.get("title", ""),
+            "year":        "",   # track.getInfo 不回傳年份，需另查
+            "track":       str(t.get("@attr", {}).get("position", "")),
+            "genre":       genre,
+            "release_id":  "",
+            "release_ids": [],
+            "cover_url":   cover_url,
         }
     except Exception as e:
         print(f"  [Last.fm] 搜尋失敗：{e}")
@@ -375,14 +377,15 @@ def search_discogs(title: str, artist: str) -> dict | None:
         cover_url = r.get("cover_image", "") or r.get("thumb", "")
         print(f"  [Discogs] 找到：{raw_title} ({year})")
         return {
-            "title":      normalize_title(title),   # Discogs 無 track title，沿用搜尋用的 title
-            "artist":     artist,
-            "album":      album,
-            "year":       year if year.isdigit() else "",
-            "track":      "",
-            "genre":      genres[0].title() if genres else "",
-            "release_id": "",
-            "cover_url":  cover_url,
+            "title":       normalize_title(title),   # Discogs 無 track title，沿用搜尋用的 title
+            "artist":      artist,
+            "album":       album,
+            "year":        year if year.isdigit() else "",
+            "track":       "",
+            "genre":       genres[0].title() if genres else "",
+            "release_id":  "",
+            "release_ids": [],
+            "cover_url":   cover_url,
         }
     except Exception as e:
         print(f"  [Discogs] 搜尋失敗：{e}")
@@ -742,12 +745,25 @@ def process_folder(files: list[Path], dry_run: bool, no_cover: bool,
     all_meta = [m for _, m in file_results]
     consensus = vote_album_consensus(all_meta)
 
-    # ── 下載封面（優先 consensus release_id，備用各曲 cover_url 多數決）──────
+    # ── 下載封面（優先 consensus release_ids，備用各曲 cover_url 多數決）─────
     cover = None
     if not no_cover:
         print()
         if consensus.get("release_id"):
-            cover = fetch_cover_art(consensus["release_id"])
+            # 收集與 consensus release_id 同一錄音的所有 release IDs，從最多的開始試
+            seen: set[str] = set()
+            rids: list[str] = [consensus["release_id"]]
+            seen.add(consensus["release_id"])
+            for m in all_meta:
+                if m and m.get("release_id") == consensus["release_id"]:
+                    for rid in m.get("release_ids", []):
+                        if rid and rid not in seen:
+                            seen.add(rid)
+                            rids.append(rid)
+            for rid in rids:
+                cover = fetch_cover_art(rid)
+                if cover:
+                    break
         if cover is None:
             cover_urls = [m["cover_url"] for m in all_meta if m and m.get("cover_url")]
             if cover_urls:
@@ -1107,6 +1123,19 @@ def _run(mode: int, target: Path, dry_run: bool, no_cover: bool,
     print("\n全部完成！")
 
 
+def _run_loop(path_prompt: str, continue_prompt: str,
+              mode: int, dry_run: bool, no_cover: bool, **run_kwargs):
+    """路徑輸入 → 執行 → 詢問是否繼續，共用於單曲和專輯模式"""
+    while True:
+        print()
+        target = _ask_path(path_prompt)
+        print()
+        _run(mode, target, dry_run, no_cover, **run_kwargs)
+        print()
+        if not _ask(continue_prompt, default=True):
+            break
+
+
 def _menu():
     """互動式選單（完成後詢問是否繼續，直到使用者選擇離開）"""
     while True:
@@ -1140,25 +1169,13 @@ def _menu():
             do_rename = _ask("重新命名檔案（XX. Title.ext）？", default=True)
             do_m3u8   = _ask("建立 M3U8 播放清單？", default=True)
 
-        # 單曲模式：完成後持續詢問下一首路徑（保留相同設定）
         if mode == 1:
-            while True:
-                print()
-                target = _ask_path("請輸入音樂檔案路徑：")
-                print()
-                _run(mode, target, dry_run, no_cover)
-                print()
-                if not _ask("繼續處理下一首？", default=True):
-                    break
+            _run_loop("請輸入音樂檔案路徑：", "繼續處理下一首？",
+                      mode, dry_run, no_cover)
         else:
-            while True:
-                print()
-                target = _ask_path("請輸入音樂資料夾路徑：")
-                print()
-                _run(mode, target, dry_run, no_cover, do_rename=do_rename, do_m3u8=do_m3u8)
-                print()
-                if not _ask("繼續處理下一個資料夾？", default=True):
-                    break
+            _run_loop("請輸入音樂資料夾路徑：", "繼續處理下一個資料夾？",
+                      mode, dry_run, no_cover,
+                      do_rename=do_rename, do_m3u8=do_m3u8)
 
 
 def main():
